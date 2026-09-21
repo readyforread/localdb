@@ -17,6 +17,7 @@ public sealed class MainForm : Form
     private const int PageSize = 100;
 
     private readonly Settings _settings = Settings.Load();
+    private readonly ToolTip _toolTip;
 
     private readonly ToolStripComboBox _cmbInstance;
     private readonly ToolStripButton _btnAutoLocalDb;
@@ -231,8 +232,7 @@ public sealed class MainForm : Form
         _txtPage = new TextBox
         {
             Width = 70,
-            Enabled = false,
-            ToolTipText = "Номер страницы"
+            Enabled = false
         };
 
         _btnFirst.Click += async (s, e) => await FirstPageAsync();
@@ -339,6 +339,9 @@ public sealed class MainForm : Form
 
         FormClosing += (s, e) => _settings.Save();
 
+        _toolTip = new ToolTip();
+        _toolTip.SetToolTip(_txtPage, "Номер страницы");
+
         Shown += async (s, e) =>
         {
             EnsureWorkDirectory();
@@ -355,7 +358,7 @@ public sealed class MainForm : Form
             AutoSize = true,
             WrapContents = false,
             BackColor = SystemColors.ControlLight,
-            Padding = new Padding(8, 4)
+            Padding = new Padding(8, 4, 8, 4)
         };
 
         panel.Controls.Add(_btnFirst);
