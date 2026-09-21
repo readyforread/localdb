@@ -2,9 +2,6 @@ name: build-win-x64
 
 on:
   push:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
 jobs:
@@ -24,15 +21,7 @@ jobs:
         run: dotnet restore
 
       - name: Publish self-contained single exe
-        run: >
-          dotnet publish MdfBakViewer.csproj
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:EnableWindowsTargeting=true
-          -o publish
+        run: dotnet publish MdfBakViewer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableWindowsTargeting=true -o publish
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
