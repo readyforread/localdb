@@ -57,7 +57,7 @@ public sealed class Settings
         }
         catch
         {
-            // молча игнорируем — это не критично
+            // ignore
         }
     }
 }
