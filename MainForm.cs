@@ -14,10 +14,14 @@ namespace MdfBakViewer;
 
 public sealed class MainForm : Form
 {
+    private readonly Settings _settings = Settings.Load();
+
     private readonly ToolStripComboBox _cmbInstance;
     private readonly ToolStripButton _btnAutoLocalDb;
     private readonly ToolStripButton _btnConnect;
     private readonly ToolStripButton _btnOpen;
+    private readonly ToolStripButton _btnWorkDir;
+    private readonly ToolStripButton _btnOpenWorkDir;
     private readonly ToolStripButton _btnRefresh;
     private readonly ToolStripButton _btnDetach;
 
@@ -28,14 +32,10 @@ public sealed class MainForm : Form
     private readonly DataGridView _dgvColumns;
     private readonly DataGridView _dgvData;
     private readonly ToolStripStatusLabel _status;
+    private readonly ToolStripStatusLabel _statusRight;
     private readonly ContextMenuStrip _treeMenu;
 
     private bool _busy;
-    private string? _lastFolder;
-
-    private static string WorkDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "MdfBakViewer");
 
     public MainForm()
     {
@@ -70,7 +70,16 @@ public sealed class MainForm : Form
             @"localhost\SQLEXPRESS"
         });
 
-        _cmbInstance.Text = @"(localdb)\MSSQLLocalDB";
+        if (!string.IsNullOrWhiteSpace(_settings.LastInstance))
+            _cmbInstance.Text = _settings.LastInstance;
+        else
+            _cmbInstance.Text = @"(localdb)\MSSQLLocalDB";
+
+        _cmbInstance.TextChanged += (s, e) =>
+        {
+            _settings.LastInstance = _cmbInstance.Text;
+            _settings.Save();
+        };
 
         _btnAutoLocalDb = new ToolStripButton("Авто LocalDB")
         {
@@ -79,6 +88,14 @@ public sealed class MainForm : Form
 
         _btnConnect = new ToolStripButton("Проверить подключение");
         _btnOpen = new ToolStripButton("Выбрать файлы...");
+        _btnWorkDir = new ToolStripButton("Рабочая папка...")
+        {
+            ToolTipText = "Выбрать папку, куда будут копироваться/восстанавливаться базы"
+        };
+        _btnOpenWorkDir = new ToolStripButton("Открыть папку")
+        {
+            ToolTipText = "Открыть рабочую папку в проводнике"
+        };
         _btnRefresh = new ToolStripButton("Обновить базы");
         _btnDetach = new ToolStripButton("Отключить базу");
 
@@ -88,12 +105,17 @@ public sealed class MainForm : Form
         toolStrip.Items.Add(_btnConnect);
         toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_btnOpen);
+        toolStrip.Items.Add(_btnWorkDir);
+        toolStrip.Items.Add(_btnOpenWorkDir);
+        toolStrip.Items.Add(new ToolStripSeparator());
         toolStrip.Items.Add(_btnRefresh);
         toolStrip.Items.Add(_btnDetach);
 
         _btnAutoLocalDb.Click += async (s, e) => await AutoLocalDbAsync();
         _btnConnect.Click += async (s, e) => await CheckConnectionAsync();
         _btnOpen.Click += async (s, e) => await OpenFileAsync();
+        _btnWorkDir.Click += (s, e) => ChooseWorkDirectory();
+        _btnOpenWorkDir.Click += (s, e) => OpenWorkDirectoryInExplorer();
         _btnRefresh.Click += async (s, e) => await RefreshDatabasesAsync();
         _btnDetach.Click += async (s, e) => await DetachSelectedDatabaseAsync();
 
@@ -181,8 +203,17 @@ public sealed class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft
         };
 
+        _statusRight = new ToolStripStatusLabel
+        {
+            BorderSides = ToolStripStatusLabelBorderSides.Left,
+            TextAlign = ContentAlignment.MiddleRight,
+            AutoSize = false,
+            Width = 520
+        };
+
         var statusStrip = new StatusStrip();
         statusStrip.Items.Add(_status);
+        statusStrip.Items.Add(_statusRight);
 
         var root = new TableLayoutPanel
         {
@@ -227,7 +258,14 @@ public sealed class MainForm : Form
         DragEnter += MainForm_DragEnter;
         DragDrop += MainForm_DragDrop;
 
-        Shown += async (s, e) => await AutoSetupAsync();
+        FormClosing += (s, e) => _settings.Save();
+
+        Shown += async (s, e) =>
+        {
+            EnsureWorkDirectory();
+            UpdateWorkDirectoryStatus();
+            await AutoSetupAsync();
+        };
     }
 
     private static DataGridView CreateGrid() => new()
@@ -265,16 +303,128 @@ public sealed class MainForm : Form
             Title = "Выберите .mdf или .bak"
         };
 
-        if (!string.IsNullOrWhiteSpace(_lastFolder) && Directory.Exists(_lastFolder))
-            dlg.InitialDirectory = _lastFolder;
+        if (!string.IsNullOrWhiteSpace(_settings.LastOpenFolder) &&
+            Directory.Exists(_settings.LastOpenFolder))
+        {
+            dlg.InitialDirectory = _settings.LastOpenFolder;
+        }
 
         if (dlg.ShowDialog(this) == DialogResult.OK)
         {
             var first = dlg.FileNames.FirstOrDefault();
             if (!string.IsNullOrWhiteSpace(first))
-                _lastFolder = Path.GetDirectoryName(first);
+            {
+                _settings.LastOpenFolder = Path.GetDirectoryName(first);
+                _settings.Save();
+            }
 
             await ProcessFilesAsync(dlg.FileNames);
+        }
+    }
+
+    private void ChooseWorkDirectory()
+    {
+        using var dlg = new FolderBrowserDialog
+        {
+            Description = "Выберите рабочую папку для баз данных.\n" +
+                          "Сюда будут копироваться .mdf и восстанавливаться .bak.",
+            ShowNewFolderButton = true,
+            UseDescriptionForTitle = true
+        };
+
+        if (!string.IsNullOrWhiteSpace(_settings.WorkDirectory) &&
+            Directory.Exists(_settings.WorkDirectory))
+        {
+            dlg.InitialDirectory = _settings.WorkDirectory;
+        }
+
+        if (dlg.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        string chosen = dlg.SelectedPath;
+
+        if (!ValidateWorkDirectory(chosen, out string error))
+        {
+            MessageBox.Show(
+                this,
+                error,
+                "Рабочая папка",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            return;
+        }
+
+        _settings.WorkDirectory = chosen;
+        _settings.Save();
+
+        EnsureWorkDirectory();
+        UpdateWorkDirectoryStatus();
+
+        ShowStatus($"Рабочая папка изменена: {chosen}");
+    }
+
+    private void OpenWorkDirectoryInExplorer()
+    {
+        EnsureWorkDirectory();
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(_settings.WorkDirectory)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowError("Не удалось открыть папку", ex);
+        }
+    }
+
+    private void EnsureWorkDirectory()
+    {
+        try
+        {
+            Directory.CreateDirectory(_settings.WorkDirectory);
+        }
+        catch (Exception ex)
+        {
+            ShowError("Не удалось создать рабочую папку", ex);
+        }
+    }
+
+    private void UpdateWorkDirectoryStatus()
+    {
+        _statusRight.Text = "Рабочая папка: " + _settings.WorkDirectory;
+        _statusRight.ToolTipText = _settings.WorkDirectory;
+    }
+
+    private static bool ValidateWorkDirectory(string path, out string error)
+    {
+        error = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            error = "Путь не может быть пустым.";
+            return false;
+        }
+
+        try
+        {
+            string full = Path.GetFullPath(path);
+            string testFile = Path.Combine(full, ".mdfbakviewer_write_test_" + Guid.NewGuid().ToString("N"));
+
+            Directory.CreateDirectory(full);
+
+            File.WriteAllBytes(testFile, Array.Empty<byte>());
+            File.Delete(testFile);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = "Нет доступа на запись в выбранную папку.\n\n" + ex.Message;
+            return false;
         }
     }
 
@@ -285,6 +435,8 @@ public sealed class MainForm : Form
         _btnAutoLocalDb.Enabled = !busy;
         _btnConnect.Enabled = !busy;
         _btnOpen.Enabled = !busy;
+        _btnWorkDir.Enabled = !busy;
+        _btnOpenWorkDir.Enabled = !busy;
         _btnRefresh.Enabled = !busy;
         _btnDetach.Enabled = !busy;
 
@@ -405,7 +557,6 @@ public sealed class MainForm : Form
                 return candidate;
         }
 
-        // Попытка оживить дефолтный LocalDB через sqllocaldb.exe
         await Task.Run(() => TrySqlLocalDb("start MSSQLLocalDB"));
 
         if (await TryConnectAsync(@"(localdb)\MSSQLLocalDB"))
@@ -493,15 +644,7 @@ public sealed class MainForm : Form
 
             if (!process.WaitForExit(15000))
             {
-                try
-                {
-                    process.Kill();
-                }
-                catch
-                {
-                    // ignore
-                }
-
+                try { process.Kill(); } catch { }
                 return -1;
             }
 
@@ -581,6 +724,22 @@ public sealed class MainForm : Form
 
             return;
         }
+
+        if (!ValidateWorkDirectory(_settings.WorkDirectory, out string error))
+        {
+            MessageBox.Show(
+                this,
+                "Рабочая папка недоступна для записи.\n\n" + error +
+                "\n\nВыбери другую папку через кнопку «Рабочая папка…».",
+                "Рабочая папка",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+
+            ChooseWorkDirectory();
+            return;
+        }
+
+        EnsureWorkDirectory();
 
         SetBusy(true);
 
@@ -858,7 +1017,7 @@ FROM {Quote(info.Database)}.{Quote(info.Schema)}.{Quote(info.Table)};";
 
         var result = MessageBox.Show(
             this,
-            $"Отключить базу {db}?\n\nФайлы базы останутся в рабочей папке приложения.",
+            $"Отключить базу {db}?\n\nФайлы базы останутся в рабочей папке:\n{_settings.WorkDirectory}",
             "Отключение базы",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question);
@@ -921,7 +1080,7 @@ EXEC sp_detach_db @dbname = @db;";
 
     private async Task<string> AttachMdfAsync(string mdfPath)
     {
-        Directory.CreateDirectory(WorkDir);
+        EnsureWorkDirectory();
 
         ShowStatus($"Копирование {Path.GetFileName(mdfPath)}...");
 
@@ -963,7 +1122,7 @@ FOR ATTACH_REBUILD_LOG;";
 
     private async Task<string> RestoreBakAsync(string bakPath)
     {
-        Directory.CreateDirectory(WorkDir);
+        EnsureWorkDirectory();
 
         ShowStatus($"Чтение заголовка {Path.GetFileName(bakPath)}...");
 
@@ -1007,7 +1166,7 @@ FOR ATTACH_REBUILD_LOG;";
             };
 
             string physical = Path.Combine(
-                WorkDir,
+                _settings.WorkDirectory,
                 $"{Sanitize(dbName, 40)}_{Sanitize(logical, 40)}_{Guid.NewGuid():N}{ext}");
 
             moves.Add($"MOVE N'{Escape(logical)}' TO N'{Escape(physical)}'");
@@ -1028,16 +1187,16 @@ WITH FILE = 1, {string.Join(", ", moves)}, REPLACE;";
         return dbName;
     }
 
-    private static async Task<string> CopyToWorkAsync(string source)
+    private async Task<string> CopyToWorkAsync(string source)
     {
-        Directory.CreateDirectory(WorkDir);
+        EnsureWorkDirectory();
 
         string fileName = Path.GetFileName(source);
         string ext = Path.GetExtension(fileName);
         string baseName = Path.GetFileNameWithoutExtension(fileName);
 
         string dest = Path.Combine(
-            WorkDir,
+            _settings.WorkDirectory,
             $"{Sanitize(baseName, 60)}_{Guid.NewGuid():N}{ext}");
 
         await using var input = new FileStream(
