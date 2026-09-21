@@ -14,6 +14,8 @@ namespace MdfBakViewer;
 
 public sealed class MainForm : Form
 {
+    private const int PageSize = 100;
+
     private readonly Settings _settings = Settings.Load();
 
     private readonly ToolStripComboBox _cmbInstance;
@@ -31,11 +33,27 @@ public sealed class MainForm : Form
     private readonly TabPage _tabData;
     private readonly DataGridView _dgvColumns;
     private readonly DataGridView _dgvData;
+
     private readonly ToolStripStatusLabel _status;
     private readonly ToolStripStatusLabel _statusRight;
+
     private readonly ContextMenuStrip _treeMenu;
 
+    private readonly Button _btnFirst;
+    private readonly Button _btnPrev;
+    private readonly Button _btnNext;
+    private readonly Button _btnLast;
+    private readonly Button _btnGo;
+    private readonly Label _lblPage;
+    private readonly Label _lblTotal;
+    private readonly TextBox _txtPage;
+
     private bool _busy;
+
+    private TableInfo? _currentDataInfo;
+    private int _currentPage;
+    private long _totalRows;
+    private long _pageCount = 1;
 
     public MainForm()
     {
@@ -184,13 +202,74 @@ public sealed class MainForm : Form
         _dgvColumns = CreateGrid();
         _dgvData = CreateGrid();
 
+        _dgvColumns.DataError += (s, e) => e.ThrowException = false;
+        _dgvData.DataError += (s, e) => e.ThrowException = false;
+
+        _dgvColumns.DefaultCellStyle.NullValue = "NULL";
+        _dgvData.DefaultCellStyle.NullValue = "NULL";
+
+        _btnFirst = new Button { Text = "«", Width = 36, Enabled = false };
+        _btnPrev = new Button { Text = "<", Width = 36, Enabled = false };
+        _btnNext = new Button { Text = ">", Width = 36, Enabled = false };
+        _btnLast = new Button { Text = "»", Width = 36, Enabled = false };
+        _btnGo = new Button { Text = "OK", Width = 40, Enabled = false };
+
+        _lblPage = new Label
+        {
+            AutoSize = true,
+            Text = "Стр. 1 из 1",
+            Margin = new Padding(8, 6, 8, 3)
+        };
+
+        _lblTotal = new Label
+        {
+            AutoSize = true,
+            Text = "Всего строк: 0",
+            Margin = new Padding(16, 6, 8, 3)
+        };
+
+        _txtPage = new TextBox
+        {
+            Width = 70,
+            Enabled = false,
+            ToolTipText = "Номер страницы"
+        };
+
+        _btnFirst.Click += async (s, e) => await FirstPageAsync();
+        _btnPrev.Click += async (s, e) => await PrevPageAsync();
+        _btnNext.Click += async (s, e) => await NextPageAsync();
+        _btnLast.Click += async (s, e) => await LastPageAsync();
+        _btnGo.Click += async (s, e) => await GoToPageAsync();
+
+        _txtPage.KeyPress += async (s, e) =>
+        {
+            if (e.KeyChar == (char)Keys.Enter)
+            {
+                e.Handled = true;
+                await GoToPageAsync();
+            }
+        };
+
         _tabs = new TabControl { Dock = DockStyle.Fill };
 
         var tabColumns = new TabPage("Структура таблицы");
-        _tabData = new TabPage("Данные (топ 100)");
+        _tabData = new TabPage("Данные (страницы по 100)");
 
         tabColumns.Controls.Add(_dgvColumns);
-        _tabData.Controls.Add(_dgvData);
+
+        var dataLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1
+        };
+
+        dataLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        dataLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        dataLayout.Controls.Add(_dgvData, 0, 0);
+        dataLayout.Controls.Add(CreatePagingPanel(), 0, 1);
+
+        _tabData.Controls.Add(dataLayout);
 
         _tabs.TabPages.Add(tabColumns);
         _tabs.TabPages.Add(_tabData);
@@ -208,7 +287,7 @@ public sealed class MainForm : Form
             BorderSides = ToolStripStatusLabelBorderSides.Left,
             TextAlign = ContentAlignment.MiddleRight,
             AutoSize = false,
-            Width = 520
+            Width = 560
         };
 
         var statusStrip = new StatusStrip();
@@ -239,7 +318,7 @@ public sealed class MainForm : Form
             async (s, e) => await RefreshDatabasesAsync());
 
         _treeMenu.Items.Add(
-            "Показать данные (топ 100)",
+            "Показать данные (страницы по 100)",
             null,
             async (s, e) =>
             {
@@ -266,6 +345,29 @@ public sealed class MainForm : Form
             UpdateWorkDirectoryStatus();
             await AutoSetupAsync();
         };
+    }
+
+    private Control CreatePagingPanel()
+    {
+        var panel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            WrapContents = false,
+            BackColor = SystemColors.ControlLight,
+            Padding = new Padding(8, 4)
+        };
+
+        panel.Controls.Add(_btnFirst);
+        panel.Controls.Add(_btnPrev);
+        panel.Controls.Add(_lblPage);
+        panel.Controls.Add(_txtPage);
+        panel.Controls.Add(_btnGo);
+        panel.Controls.Add(_btnNext);
+        panel.Controls.Add(_btnLast);
+        panel.Controls.Add(_lblTotal);
+
+        return panel;
     }
 
     private static DataGridView CreateGrid() => new()
@@ -439,6 +541,20 @@ public sealed class MainForm : Form
         _btnOpenWorkDir.Enabled = !busy;
         _btnRefresh.Enabled = !busy;
         _btnDetach.Enabled = !busy;
+
+        if (busy)
+        {
+            _btnFirst.Enabled = false;
+            _btnPrev.Enabled = false;
+            _btnNext.Enabled = false;
+            _btnLast.Enabled = false;
+            _btnGo.Enabled = false;
+            _txtPage.Enabled = false;
+        }
+        else if (_currentDataInfo is not null)
+        {
+            UpdatePaging(_dgvData.Rows.Count);
+        }
 
         UseWaitCursor = busy;
     }
@@ -895,8 +1011,6 @@ ORDER BY s.name, t.name;";
 
     private async Task TreeAfterSelectAsync(TreeNode node)
     {
-        _dgvData.DataSource = null;
-
         if (node.Tag is TableInfo info)
         {
             await LoadColumnsAsync(info);
@@ -957,24 +1071,116 @@ ORDER BY ORDINAL_POSITION;";
 
     private async Task LoadDataAsync(TableInfo info)
     {
+        _currentDataInfo = info;
+        _currentPage = 0;
+
+        await LoadPageAsync();
+
+        _tabs.SelectedTab = _tabData;
+    }
+
+    private async Task LoadPageAsync()
+    {
+        if (_currentDataInfo is null)
+            return;
+
         try
         {
             SetBusy(true);
-            ShowStatus($"Чтение данных {info.Schema}.{info.Table}...");
+
+            ShowStatus($"Чтение данных {_currentDataInfo.Schema}.{_currentDataInfo.Table}, страница {_currentPage + 1}...");
 
             await using var conn = CreateConnection();
             await conn.OpenAsync();
 
-            string sql = $@"
-SELECT TOP 100 *
-FROM {Quote(info.Database)}.{Quote(info.Schema)}.{Quote(info.Table)};";
+            string tableSql =
+                $"{Quote(_currentDataInfo.Database)}." +
+                $"{Quote(_currentDataInfo.Schema)}." +
+                $"{Quote(_currentDataInfo.Table)}";
 
-            var dt = await ExecuteQueryAsync(conn, sql, 120);
+            try
+            {
+                object? countObj = await ExecuteScalarAsync(
+                    conn,
+                    $"SELECT COUNT_BIG(*) FROM {tableSql} WITH (NOLOCK);",
+                    120);
+
+                _totalRows = countObj == null || countObj == DBNull.Value
+                    ? 0
+                    : Convert.ToInt64(countObj);
+            }
+            catch
+            {
+                _totalRows = -1;
+            }
+
+            if (_totalRows >= 0)
+            {
+                _pageCount = Math.Max(1L, (_totalRows + PageSize - 1) / PageSize);
+
+                if (_currentPage >= _pageCount)
+                    _currentPage = (int)Math.Max(0L, Math.Min(_pageCount - 1, int.MaxValue));
+            }
+
+            string orderBy = "(SELECT NULL)";
+            try
+            {
+                orderBy = await GetOrderByClauseAsync(conn, _currentDataInfo);
+            }
+            catch
+            {
+                orderBy = "(SELECT NULL)";
+            }
+
+            string selectList = "*";
+            try
+            {
+                selectList = await BuildSelectListAsync(conn, _currentDataInfo);
+            }
+            catch
+            {
+                selectList = "*";
+            }
+
+            DataTable dt;
+
+            try
+            {
+                dt = await FetchDataAsync(conn, tableSql, selectList, orderBy, useNoLock: true);
+            }
+            catch
+            {
+                try
+                {
+                    dt = await FetchDataAsync(conn, tableSql, selectList, orderBy, useNoLock: false);
+                }
+                catch
+                {
+                    try
+                    {
+                        dt = await FetchDataAsync(conn, tableSql, "*", orderBy, useNoLock: true);
+                    }
+                    catch
+                    {
+                        dt = await FetchDataAsync(conn, tableSql, "*", orderBy, useNoLock: false);
+                    }
+                }
+            }
 
             _dgvData.DataSource = dt;
-            _tabs.SelectedIndex = 1;
 
-            ShowStatus($"Показаны первые {dt.Rows.Count} строк из {info.Schema}.{info.Table}.");
+            UpdatePaging(dt.Rows.Count);
+
+            if (orderBy == "(SELECT NULL)")
+            {
+                ShowStatus(
+                    $"Данные загружены. Внимание: у таблицы нет ключа/кластерного индекса, порядок строк может быть нестабильным.");
+            }
+            else
+            {
+                ShowStatus(
+                    $"Данные загружены: {_currentDataInfo.Schema}.{_currentDataInfo.Table}, страница {_currentPage + 1}.");
+            }
         }
         catch (Exception ex)
         {
@@ -983,6 +1189,339 @@ FROM {Quote(info.Database)}.{Quote(info.Schema)}.{Quote(info.Table)};";
         finally
         {
             SetBusy(false);
+        }
+    }
+
+    private async Task<DataTable> FetchDataAsync(
+        SqlConnection conn,
+        string tableSql,
+        string selectList,
+        string orderBy,
+        bool useNoLock)
+    {
+        string rowNumberColumn = "__rn_" + Guid.NewGuid().ToString("N");
+
+        string noLock = useNoLock ? " WITH (NOLOCK)" : string.Empty;
+
+        int start = _currentPage * PageSize;
+        int end = start + PageSize;
+
+        string sql = $@"
+SELECT *
+FROM (
+    SELECT {selectList}, ROW_NUMBER() OVER (ORDER BY {orderBy}) AS {Quote(rowNumberColumn)}
+    FROM {tableSql} AS t{noLock}
+) AS x
+WHERE x.{Quote(rowNumberColumn)} > @start AND x.{Quote(rowNumberColumn)} <= @end
+ORDER BY x.{Quote(rowNumberColumn)};";
+
+        using var cmd = new SqlCommand(sql, conn)
+        {
+            CommandTimeout = 180
+        };
+
+        cmd.Parameters.Add("@start", SqlDbType.Int).Value = start;
+        cmd.Parameters.Add("@end", SqlDbType.Int).Value = end;
+
+        var dt = await ExecuteQueryAsync(cmd);
+
+        if (dt.Columns.Contains(rowNumberColumn))
+            dt.Columns.Remove(rowNumberColumn);
+
+        return dt;
+    }
+
+    private async Task<string> GetOrderByClauseAsync(SqlConnection conn, TableInfo info)
+    {
+        string pkSql = $@"
+SELECT c.name, ic.is_descending_key
+FROM {Quote(info.Database)}.sys.tables t
+JOIN {Quote(info.Database)}.sys.schemas s ON t.schema_id = s.schema_id
+JOIN {Quote(info.Database)}.sys.indexes i ON i.object_id = t.object_id
+JOIN {Quote(info.Database)}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN {Quote(info.Database)}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE s.name = @schema
+  AND t.name = @table
+  AND i.is_primary_key = 1
+  AND i.is_disabled = 0
+  AND ic.is_included_column = 0
+ORDER BY ic.key_ordinal;";
+
+        var pk = await ExecuteQueryAsync(conn, pkSql, cmd =>
+        {
+            cmd.Parameters.AddWithValue("@schema", info.Schema);
+            cmd.Parameters.AddWithValue("@table", info.Table);
+        });
+
+        var orderBy = BuildOrderByFromColumns(pk);
+        if (!string.IsNullOrWhiteSpace(orderBy))
+            return orderBy;
+
+        string clusteredSql = $@"
+SELECT c.name, ic.is_descending_key
+FROM {Quote(info.Database)}.sys.tables t
+JOIN {Quote(info.Database)}.sys.schemas s ON t.schema_id = s.schema_id
+JOIN {Quote(info.Database)}.sys.indexes i ON i.object_id = t.object_id
+JOIN {Quote(info.Database)}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN {Quote(info.Database)}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE s.name = @schema
+  AND t.name = @table
+  AND i.type = 1
+  AND i.is_disabled = 0
+  AND ic.is_included_column = 0
+ORDER BY ic.key_ordinal;";
+
+        var clustered = await ExecuteQueryAsync(conn, clusteredSql, cmd =>
+        {
+            cmd.Parameters.AddWithValue("@schema", info.Schema);
+            cmd.Parameters.AddWithValue("@table", info.Table);
+        });
+
+        orderBy = BuildOrderByFromColumns(clustered);
+        if (!string.IsNullOrWhiteSpace(orderBy))
+            return orderBy;
+
+        return "(SELECT NULL)";
+    }
+
+    private static string BuildOrderByFromColumns(DataTable dt)
+    {
+        if (dt.Rows.Count == 0)
+            return string.Empty;
+
+        var parts = new List<string>();
+
+        foreach (DataRow row in dt.Rows)
+        {
+            string name = row["name"]?.ToString() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            bool desc = row["is_descending_key"] != DBNull.Value &&
+                        Convert.ToBoolean(row["is_descending_key"]);
+
+            parts.Add($"t.{Quote(name)} {(desc ? "DESC" : "ASC")}");
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    private async Task<string> BuildSelectListAsync(SqlConnection conn, TableInfo info)
+    {
+        string sql = $@"
+SELECT COLUMN_NAME, DATA_TYPE
+FROM {Quote(info.Database)}.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table
+ORDER BY ORDINAL_POSITION;";
+
+        var dt = await ExecuteQueryAsync(conn, sql, cmd =>
+        {
+            cmd.Parameters.AddWithValue("@schema", info.Schema);
+            cmd.Parameters.AddWithValue("@table", info.Table);
+        });
+
+        if (dt.Rows.Count == 0)
+            return "*";
+
+        var parts = new List<string>();
+
+        foreach (DataRow row in dt.Rows)
+        {
+            string column = row["COLUMN_NAME"]?.ToString() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(column))
+                continue;
+
+            string type = row["DATA_TYPE"]?.ToString()?.ToLowerInvariant() ?? string.Empty;
+
+            string expression = BuildColumnExpression(column, type);
+            parts.Add($"{expression} AS {Quote(column)}");
+        }
+
+        if (parts.Count == 0)
+            return "*";
+
+        return string.Join(",\n", parts);
+    }
+
+    private static string BuildColumnExpression(string columnName, string dataType)
+    {
+        string q = Quote(columnName);
+        string tcol = $"t.{q}";
+
+        switch (dataType)
+        {
+            case "binary":
+            case "varbinary":
+            case "image":
+            case "timestamp":
+            case "rowversion":
+                return
+                    $"CASE WHEN {tcol} IS NULL THEN NULL " +
+                    $"ELSE '0x' + CONVERT(VARCHAR(200), SUBSTRING(CAST({tcol} AS VARBINARY(MAX)), 1, 100), 2) " +
+                    $" + CASE WHEN DATALENGTH({tcol}) > 100 THEN '...' ELSE '' END END";
+
+            case "geography":
+            case "geometry":
+                return $"CASE WHEN {tcol} IS NULL THEN NULL ELSE {tcol}.STAsText() END";
+
+            case "hierarchyid":
+                return $"CAST({tcol} AS NVARCHAR(4000))";
+
+            case "xml":
+                return $"LEFT(CAST({tcol} AS NVARCHAR(MAX)), 4000)";
+
+            case "sql_variant":
+                return $"TRY_CAST({tcol} AS NVARCHAR(4000))";
+
+            case "text":
+            case "ntext":
+            case "char":
+            case "nchar":
+            case "varchar":
+            case "nvarchar":
+                return $"LEFT(CAST({tcol} AS NVARCHAR(MAX)), 4000)";
+
+            case "bigint":
+            case "int":
+            case "smallint":
+            case "tinyint":
+            case "bit":
+            case "decimal":
+            case "numeric":
+            case "money":
+            case "smallmoney":
+            case "float":
+            case "real":
+            case "date":
+            case "datetime":
+            case "datetime2":
+            case "smalldatetime":
+            case "datetimeoffset":
+            case "time":
+            case "uniqueidentifier":
+                return tcol;
+
+            default:
+                return $"TRY_CAST({tcol} AS NVARCHAR(4000))";
+        }
+    }
+
+    private async Task FirstPageAsync()
+    {
+        if (_currentDataInfo is null || _currentPage == 0)
+            return;
+
+        _currentPage = 0;
+        await LoadPageAsync();
+    }
+
+    private async Task PrevPageAsync()
+    {
+        if (_currentDataInfo is null || _currentPage <= 0)
+            return;
+
+        _currentPage--;
+        await LoadPageAsync();
+    }
+
+    private async Task NextPageAsync()
+    {
+        if (_currentDataInfo is null)
+            return;
+
+        if (_totalRows >= 0 && _currentPage >= _pageCount - 1)
+            return;
+
+        _currentPage++;
+        await LoadPageAsync();
+    }
+
+    private async Task LastPageAsync()
+    {
+        if (_currentDataInfo is null || _totalRows < 0)
+            return;
+
+        _currentPage = (int)Math.Max(0L, _pageCount - 1);
+        await LoadPageAsync();
+    }
+
+    private async Task GoToPageAsync()
+    {
+        if (_currentDataInfo is null)
+            return;
+
+        if (!long.TryParse(_txtPage.Text, out long page))
+            return;
+
+        if (page < 1)
+            page = 1;
+
+        if (_totalRows >= 0 && page > _pageCount)
+            page = _pageCount;
+
+        _currentPage = (int)Math.Min(page - 1, int.MaxValue);
+
+        await LoadPageAsync();
+    }
+
+    private void UpdatePaging(int rowsOnPage)
+    {
+        if (_currentDataInfo is null)
+        {
+            _btnFirst.Enabled = false;
+            _btnPrev.Enabled = false;
+            _btnNext.Enabled = false;
+            _btnLast.Enabled = false;
+            _btnGo.Enabled = false;
+            _txtPage.Enabled = false;
+
+            _lblPage.Text = "Стр. 1 из 1";
+            _lblTotal.Text = "Всего строк: 0";
+            _txtPage.Text = "1";
+
+            return;
+        }
+
+        if (_totalRows >= 0)
+        {
+            _pageCount = Math.Max(1L, (_totalRows + PageSize - 1) / PageSize);
+
+            if (_currentPage >= _pageCount)
+                _currentPage = (int)Math.Max(0L, Math.Min(_pageCount - 1, int.MaxValue));
+
+            _lblPage.Text = $"Стр. {_currentPage + 1} из {_pageCount}";
+            _lblTotal.Text = $"Всего строк: {_totalRows:N0}";
+            _txtPage.Text = (_currentPage + 1).ToString();
+
+            bool canPrev = _currentPage > 0;
+            bool canNext = _currentPage < _pageCount - 1;
+
+            _btnFirst.Enabled = canPrev;
+            _btnPrev.Enabled = canPrev;
+            _btnNext.Enabled = canNext;
+            _btnLast.Enabled = canNext;
+
+            _txtPage.Enabled = _pageCount > 1;
+            _btnGo.Enabled = _pageCount > 1;
+        }
+        else
+        {
+            _pageCount = _currentPage + (rowsOnPage == PageSize ? 2 : 1);
+
+            _lblPage.Text = $"Стр. {_currentPage + 1}";
+            _lblTotal.Text = "Всего строк: ?";
+            _txtPage.Text = (_currentPage + 1).ToString();
+
+            bool canPrev = _currentPage > 0;
+
+            _btnFirst.Enabled = canPrev;
+            _btnPrev.Enabled = canPrev;
+
+            _btnNext.Enabled = rowsOnPage == PageSize;
+            _btnLast.Enabled = false;
+
+            _txtPage.Enabled = false;
+            _btnGo.Enabled = false;
         }
     }
 
@@ -1257,15 +1796,26 @@ WITH FILE = 1, {string.Join(", ", moves)}, REPLACE;";
         return new SqlConnection(builder.ConnectionString);
     }
 
+    private static Task<DataTable> ExecuteQueryAsync(
+        SqlConnection conn,
+        string sql,
+        int timeout = 30)
+    {
+        return ExecuteQueryAsync(conn, sql, null, timeout);
+    }
+
     private static async Task<DataTable> ExecuteQueryAsync(
         SqlConnection conn,
         string sql,
+        Action<SqlCommand>? configure,
         int timeout = 30)
     {
         using var cmd = new SqlCommand(sql, conn)
         {
             CommandTimeout = timeout
         };
+
+        configure?.Invoke(cmd);
 
         return await ExecuteQueryAsync(cmd);
     }
@@ -1278,6 +1828,19 @@ WITH FILE = 1, {string.Join(", ", moves)}, REPLACE;";
         dt.Load(reader);
 
         return dt;
+    }
+
+    private static async Task<object?> ExecuteScalarAsync(
+        SqlConnection conn,
+        string sql,
+        int timeout = 30)
+    {
+        using var cmd = new SqlCommand(sql, conn)
+        {
+            CommandTimeout = timeout
+        };
+
+        return await cmd.ExecuteScalarAsync();
     }
 
     private static async Task ExecuteNonQueryAsync(
