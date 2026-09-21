@@ -8,7 +8,6 @@
     <Nullable>enable</Nullable>
     <AssemblyName>MdfBakViewer</AssemblyName>
     <RootNamespace>MdfBakViewer</RootNamespace>
-    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
   <ItemGroup>
